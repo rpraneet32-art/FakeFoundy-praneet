@@ -66,7 +66,10 @@ export class ProposalStore {
     return target;
   }
   async read(path: string) {
-    const content = await readFile(await this.safePath(path), "utf8");
+    // Editors consume a UTF-8 byte order mark while decoding, so TextDocument.getText()
+    // never contains it. Strip exactly one leading BOM so disk text and the editor model
+    // agree; any U+FEFF elsewhere in the file is content and stays intact.
+    const content = (await readFile(await this.safePath(path), "utf8")).replace(/^\uFEFF/, "");
     if (content.includes("\0")) throw new Error("Binary files are not supported");
     return content;
   }
