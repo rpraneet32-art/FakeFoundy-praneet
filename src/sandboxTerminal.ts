@@ -88,6 +88,12 @@ export async function runSandboxTerminal(store: ProposalStore, input: TerminalRe
   } finally { if(snapshot) await rm(snapshot,{recursive:true,force:true});active.delete(store); }
 }
 
+const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
+/** Proposal text comes from ProposalStore.read(), which consumes one leading UTF-8 BOM. */
+function withoutBom(bytes: Buffer) {
+  return bytes.subarray(0, UTF8_BOM.length).equals(UTF8_BOM) ? bytes.subarray(UTF8_BOM.length) : bytes;
+}
+
 /** Snapshot-only binary reader: editor/model read tools remain text-only. */
 async function readSnapshotBytes(store: ProposalStore, canonicalRoot: string, path: string): Promise<Buffer> {
   if(!path || isAbsolute(path) || path.split(/[\\/]/).includes(".."))
@@ -140,11 +146,17 @@ export async function prepareSnapshot(store: ProposalStore, snapshot: string, si
       if(signal?.aborted) throw new Error("Cancelled while preparing snapshot.");
       const original=await readSnapshotBytes(store,canonicalRoot,path);
       const proposal=proposals.get(path);
+      // Compare the same decoded text the proposal was staged from: a leading
+      // BOM is encoding, not content, so a BOM-prefixed file is not stale.
+      const source=proposal?withoutBom(original):original;
       // Validate the actual opened bytes, not just an earlier path read. The
       // user's file may change between proposal collection and this copy.
-      if(proposal && !original.equals(Buffer.from(proposal.before,"utf8")))
+      if(proposal && !source.equals(Buffer.from(proposal.before,"utf8")))
         throw new Error("File changed while preparing snapshot; regenerate before testing staged edits");
-      const content=proposal?Buffer.from(proposal.after,"utf8"):original;
+      // Keep the original encoding mark so snapshot bytes match an editor save.
+      const content=proposal
+        ?Buffer.concat([original.subarray(0,original.length-source.length),Buffer.from(proposal.after,"utf8")])
+        :original;
       total+=Buffer.byteLength(content);
       if(total>20*1024*1024) throw new Error("Workspace exceeds the 20 MiB snapshot bound. Nothing executed.");
       if(!path || isAbsolute(path) || path.split(/[\\/]/).includes(".."))

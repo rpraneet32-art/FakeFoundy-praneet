@@ -1,11 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ProposalStore } from "../proposals.js";
 import { startBridge } from "../bridge.js";
 import { applyHunks } from "../hunks.js";
+import { prepareSnapshot } from "../sandboxTerminal.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
@@ -52,6 +53,72 @@ test("a UTF-8 BOM file reads exactly like the editor model, in every read path",
     assert.deepEqual(searched.matches.map(match => match.line), [3]);
   } finally {
     await rm(root, { recursive: true });
+  }
+});
+
+test("a CRLF file keeps its line endings through reads, ranges, patches and hunks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ff-crlf-"));
+  const crlf = ["import os", "", "def get_debug_flag():", "    return True", ""].join("\r\n");
+  try {
+    await writeFile(join(root, "helpers.py"), crlf, "utf8");
+    const store = new ProposalStore(root);
+
+    // Decoding utf8 keeps CRLF as-is, which is what the editor model holds.
+    assert.equal(await store.read("helpers.py"), crlf);
+    assert.equal((await store.readRange("helpers.py", 4, 1)).text, "    return True\r\n");
+    assert.equal((await store.readRange("helpers.py", 1, 2)).total_lines, 4);
+
+    store.beginRun();
+    // An LF-only anchor is not the file's text: CRLF files must be quoted exactly.
+    await assert.rejects(
+      store.proposePatch("helpers.py", "import os\n\ndef get_debug_flag():", "import os\n\ndef get_debug_flag():  # patched"),
+      /does not match original disk text/);
+
+    const patch = await store.proposePatch("helpers.py",
+      "def get_debug_flag():\r\n    return True", "def get_debug_flag():\r\n    return False");
+    assert.equal(patch.before, crlf);
+    assert.match(patch.after, /\r\n    return False\r\n/);
+    assert.equal(patch.after.replace(/\r\n/g, "").includes("\n"), false, "no bare LF is introduced");
+
+    // Hunk application and the review preview round-trip CRLF exactly.
+    const accepted = patch.hunks.map(hunk => hunk.id);
+    assert.equal(applyHunks(patch.before, patch.hunks, accepted), patch.after);
+    assert.equal(store.preview(patch.id, accepted), patch.after);
+
+    // A BOM in front of CRLF text drops only the BOM.
+    await writeFile(join(root, "bomcrlf.py"), BOM + crlf, "utf8");
+    assert.equal(await store.read("bomcrlf.py"), crlf);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a BOM-prefixed staged file keeps its encoding mark through prepareSnapshot",
+  {skip: process.platform !== "linux" && "requires Linux /proc/self/fd"}, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "ff-bom-snapshot-"));
+  const root = join(parent, "workspace"), snapshot = join(parent, "snapshot");
+  const crlf = ["import os", "", "def get_debug_flag():", "    return True", ""].join("\r\n");
+  try {
+    await mkdir(root);
+    await mkdir(snapshot);
+    await writeFile(join(root, "helpers.py"), BOM + crlf, "utf8");
+    await writeFile(join(root, "untouched.py"), BOM + crlf, "utf8");
+    const store = new ProposalStore(root);
+    store.beginRun();
+    const patch = await store.proposePatch("helpers.py", "    return True", "    return False");
+    assert.equal(patch.before, crlf, "the proposal is staged from BOM-free text");
+
+    await prepareSnapshot(store, snapshot);
+
+    // Staged text replaces the bytes, but the original encoding mark survives.
+    assert.equal(await readFile(join(snapshot, "helpers.py"), "utf8"), BOM + patch.after);
+    assert.match(await readFile(join(snapshot, "helpers.py"), "utf8"), /\r\n    return False\r\n/);
+    // A BOM file with no proposal is copied byte for byte.
+    assert.deepEqual(await readFile(join(snapshot, "untouched.py")), Buffer.from(BOM + crlf, "utf8"));
+    // The workspace itself is never written.
+    assert.equal(await readFile(join(root, "helpers.py"), "utf8"), BOM + crlf);
+  } finally {
+    await rm(parent, { recursive: true });
   }
 });
 
