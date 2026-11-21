@@ -11,3 +11,8 @@ dist/
 # Local rehearsal workspaces and verification evidence.
 /.validation/
 /docs/verification.md
+
+# Local editor and agent state, never shared.
+/.freebuff/
+/.cloud-attachments/
+/.vscode/settings.json
